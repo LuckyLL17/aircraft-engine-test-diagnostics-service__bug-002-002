@@ -1,73 +1,196 @@
 import { invariant } from '../errors.ts';
 import type { CalibratedSample, EnginePhaseName, PhaseSegment } from '../types.ts';
 
-type RpmPoint = { time: number; rpm: number; fuel: number };
+const IDLE_RPM_THRESHOLD = 500;
+const SLOPE_THRESHOLD_RPM_PER_SECOND = 0.25;
 
-function collectPoints(samples: CalibratedSample[]): RpmPoint[] {
-  const byTime = new Map<number, RpmPoint>();
+type RpmPoint = { time: number; rpm: number };
+type FuelPoint = { time: number; fuel: number };
+
+type WorkingSegment = {
+  phase: EnginePhaseName;
+  startMs: number;
+  endMs: number;
+  sampleCount: number;
+  rpmSum: number;
+  peakRpm: number;
+  fuelSum: number;
+  fuelSampleCount: number;
+};
+
+function collectSamples(samples: CalibratedSample[]): { rpmPoints: RpmPoint[]; fuelPoints: FuelPoint[] } {
+  const rpmPoints: RpmPoint[] = [];
+  const fuelPoints: FuelPoint[] = [];
   for (const sample of samples) {
-    const point = byTime.get(sample.sampleTimeMs) ?? { time: sample.sampleTimeMs, rpm: Number.NaN, fuel: Number.NaN };
-    if (sample.sensor === 'rpm') point.rpm = sample.calibratedValue;
-    if (sample.sensor === 'fuel-flow') point.fuel = sample.calibratedValue;
-    byTime.set(sample.sampleTimeMs, point);
+    if (!Number.isFinite(sample.calibratedValue)) continue;
+    if (sample.sensor === 'rpm') rpmPoints.push({ time: sample.sampleTimeMs, rpm: sample.calibratedValue });
+    if (sample.sensor === 'fuel-flow') fuelPoints.push({ time: sample.sampleTimeMs, fuel: sample.calibratedValue });
   }
-  return [...byTime.values()].sort((a, b) => a.time - b.time).filter((point) => Number.isFinite(point.rpm));
+  const byTime = (a: { time: number }, b: { time: number }) => a.time - b.time;
+  rpmPoints.sort(byTime);
+  fuelPoints.sort(byTime);
+  return { rpmPoints, fuelPoints };
 }
 
-function phaseForSlope(slope: number, rpm: number): EnginePhaseName {
-  if (rpm <= 500) return 'shutdown';
-  if (slope >= 0.25) return 'acceleration';
-  if (slope <= -0.25) return 'deceleration';
-  return 'steady';
+function classifyPhases(points: RpmPoint[]): EnginePhaseName[] {
+  const phases: EnginePhaseName[] = [];
+  let hasLeftIdle = false;
+
+  for (let i = 0; i < points.length; i += 1) {
+    const point = points[i];
+    let slopeRpmPerSecond = 0;
+    if (i > 0) {
+      const elapsedMs = point.time - points[i - 1].time;
+      if (elapsedMs > 0) slopeRpmPerSecond = (point.rpm - points[i - 1].rpm) / elapsedMs * 1000;
+    }
+
+    let phase: EnginePhaseName;
+    if (point.rpm <= IDLE_RPM_THRESHOLD) {
+      phase = hasLeftIdle ? 'shutdown' : 'idle';
+    } else if (slopeRpmPerSecond >= SLOPE_THRESHOLD_RPM_PER_SECOND) {
+      phase = 'acceleration';
+    } else if (slopeRpmPerSecond <= -SLOPE_THRESHOLD_RPM_PER_SECOND) {
+      phase = 'deceleration';
+    } else {
+      phase = 'steady';
+    }
+
+    phases.push(phase);
+    hasLeftIdle ||= point.rpm > IDLE_RPM_THRESHOLD;
+  }
+
+  return phases;
 }
 
-function transitionDuration(points: RpmPoint[]): number {
-  if (points.length < 2) return 0;
-  return Math.max(0, points.at(-1)!.time - points[0].time);
+function createSegment(phase: EnginePhaseName, point: RpmPoint): WorkingSegment {
+  return {
+    phase,
+    startMs: point.time,
+    endMs: point.time,
+    sampleCount: 1,
+    rpmSum: point.rpm,
+    peakRpm: point.rpm,
+    fuelSum: 0,
+    fuelSampleCount: 0,
+  };
+}
+
+function addRpmPoint(segment: WorkingSegment, point: RpmPoint): void {
+  segment.sampleCount += 1;
+  segment.rpmSum += point.rpm;
+  segment.peakRpm = Math.max(segment.peakRpm, point.rpm);
+  segment.endMs = point.time;
+}
+
+function buildRawSegments(points: RpmPoint[], phases: EnginePhaseName[]): WorkingSegment[] {
+  const segments: WorkingSegment[] = [];
+  for (const [index, point] of points.entries()) {
+    const phase = phases[index];
+    const previous = segments.at(-1);
+    if (previous && previous.phase === phase) addRpmPoint(previous, point);
+    else segments.push(createSegment(phase, point));
+  }
+
+  // A transition is detected at its first sample of the new phase.  The preceding
+  // phase ends at that same boundary, so irregular gaps remain covered exactly once.
+  for (let i = 0; i < segments.length - 1; i += 1) segments[i].endMs = segments[i + 1].startMs;
+  return segments;
+}
+
+function segmentIndexAtTime(segments: WorkingSegment[], time: number): number {
+  let low = 0;
+  let high = segments.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (segments[middle].startMs <= time) low = middle + 1;
+    else high = middle;
+  }
+  return Math.max(0, low - 1);
+}
+
+function assignFuelSamples(segments: WorkingSegment[], fuelPoints: FuelPoint[]): void {
+  if (segments.length === 0) return;
+  for (const point of fuelPoints) {
+    const segment = segments[segmentIndexAtTime(segments, point.time)];
+    segment.fuelSum += point.fuel;
+    segment.fuelSampleCount += 1;
+  }
+}
+
+function durationOf(segment: WorkingSegment): number {
+  return segment.endMs - segment.startMs;
+}
+
+function mergeSegments(left: WorkingSegment, right: WorkingSegment, phase: EnginePhaseName): WorkingSegment {
+  return {
+    phase,
+    startMs: left.startMs,
+    endMs: right.endMs,
+    sampleCount: left.sampleCount + right.sampleCount,
+    rpmSum: left.rpmSum + right.rpmSum,
+    peakRpm: Math.max(left.peakRpm, right.peakRpm),
+    fuelSum: left.fuelSum + right.fuelSum,
+    fuelSampleCount: left.fuelSampleCount + right.fuelSampleCount,
+  };
+}
+
+function isDominant(left: WorkingSegment, right: WorkingSegment): boolean {
+  return durationOf(left) > durationOf(right)
+    || (durationOf(left) === durationOf(right) && left.sampleCount >= right.sampleCount);
+}
+
+function mergeShortSegments(segments: WorkingSegment[], minimumDurationMs: number): WorkingSegment[] {
+  const result = [...segments];
+
+  while (true) {
+    const index = result.findIndex((segment) => durationOf(segment) < minimumDurationMs);
+    if (index === -1 || result.length === 1) return result;
+
+    if (index === 0) {
+      result.splice(0, 2, mergeSegments(result[0], result[1], result[1].phase));
+      continue;
+    }
+
+    const left = result[index - 1];
+    const short = result[index];
+    const right = result[index + 1];
+
+    if (!right) {
+      result.splice(index - 1, 2, mergeSegments(left, short, left.phase));
+    } else if (left.phase === right.phase) {
+      const merged = mergeSegments(mergeSegments(left, short, left.phase), right, left.phase);
+      result.splice(index - 1, 3, merged);
+    } else if (left.phase === short.phase && right.phase !== short.phase) {
+      result.splice(index - 1, 2, mergeSegments(left, short, left.phase));
+    } else if (right.phase === short.phase && left.phase !== short.phase) {
+      result.splice(index, 2, mergeSegments(short, right, right.phase));
+    } else if (isDominant(left, right)) {
+      result.splice(index - 1, 2, mergeSegments(left, short, left.phase));
+    } else {
+      result.splice(index, 2, mergeSegments(short, right, right.phase));
+    }
+  }
+}
+
+function toPhaseSegment(segment: WorkingSegment): PhaseSegment {
+  return {
+    phase: segment.phase,
+    startMs: segment.startMs,
+    endMs: segment.endMs,
+    sampleCount: segment.sampleCount,
+    meanRpm: segment.rpmSum / segment.sampleCount,
+    peakRpm: segment.peakRpm,
+    meanFuelFlow: segment.fuelSampleCount ? segment.fuelSum / segment.fuelSampleCount : 0,
+  };
 }
 
 export function segmentOperatingPhases(samples: CalibratedSample[], minimumPhaseDurationMs = 500): PhaseSegment[] {
-  const points = collectPoints(samples);
-  invariant(points.length > 0, 'RPM_DATA_MISSING', 'At least one calibrated RPM sample is required');
-  const segments: PhaseSegment[] = [];
-  let current: { phase: EnginePhaseName; points: RpmPoint[] } = { phase: phaseForSlope(0, points[0].rpm), points: [points[0]] };
-  for (let i = 1; i < points.length; i += 1) {
-    const previous = points[i - 1];
-    const point = points[i];
-    const duration = Math.max(1, point.time - previous.time);
-    const slope = (point.rpm - previous.rpm) / duration * 1000;
-    const phase = phaseForSlope(slope, point.rpm);
-    const candidateDuration = transitionDuration([...current.points, point]);
-    const phaseChanged = phase !== current.phase;
-    const shouldSplit = phaseChanged && candidateDuration >= minimumPhaseDurationMs;
-    if (shouldSplit) {
-      segments.push(toSegment(current.phase, current.points));
-      current = { phase, points: [point] };
-    } else {
-      current.points.push(point);
-    }
-  }
-  segments.push(toSegment(current.phase, current.points));
-  return mergeShortSegments(segments, minimumPhaseDurationMs);
-}
+  const { rpmPoints, fuelPoints } = collectSamples(samples);
+  invariant(rpmPoints.length > 0, 'RPM_DATA_MISSING', 'At least one calibrated RPM sample is required');
 
-function toSegment(phase: EnginePhaseName, points: RpmPoint[]): PhaseSegment {
-  const finiteFuel = points.map((point) => point.fuel).filter(Number.isFinite);
-  const rpms = points.map((point) => point.rpm);
-  return { phase, startMs: points[0].time, endMs: points.at(-1)!.time, sampleCount: points.length, meanRpm: rpms.reduce((a, b) => a + b, 0) / rpms.length, peakRpm: Math.max(...rpms), meanFuelFlow: finiteFuel.length ? finiteFuel.reduce((a, b) => a + b, 0) / finiteFuel.length : 0 };
-}
+  const phases = classifyPhases(rpmPoints);
+  const segments = buildRawSegments(rpmPoints, phases);
+  assignFuelSamples(segments, fuelPoints);
 
-function mergeShortSegments(segments: PhaseSegment[], minimumDuration: number): PhaseSegment[] {
-  if (segments.length < 2) return segments;
-  const result: PhaseSegment[] = [];
-  for (const segment of segments) {
-    const previous = result.at(-1);
-    const duration = segment.endMs - segment.startMs;
-    if (previous && duration <= minimumDuration) {
-      const total = previous.sampleCount + segment.sampleCount;
-      const merged = { ...previous, endMs: segment.endMs, sampleCount: total, peakRpm: Math.max(previous.peakRpm, segment.peakRpm), meanRpm: (previous.meanRpm * previous.sampleCount + segment.meanRpm * segment.sampleCount) / total, meanFuelFlow: (previous.meanFuelFlow * previous.sampleCount + segment.meanFuelFlow * segment.sampleCount) / total };
-      result[result.length - 1] = merged;
-    } else result.push(segment);
-  }
-  return result;
+  return mergeShortSegments(segments, minimumPhaseDurationMs).map(toPhaseSegment);
 }
